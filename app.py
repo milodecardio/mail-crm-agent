@@ -1,5 +1,7 @@
 from flask import Flask, render_template_string, request, jsonify, Response
-import threading, requests, msal, os, csv, io, re, subprocess, signal, time, json
+import threading, requests, msal, os, csv, io, re, subprocess, signal, time, json, sys
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ===============================================================================
 # Mail CRM Agent – generiert nach MASTER PROMPT V6 (Zero-Loss, Graceful Stop,
@@ -691,6 +693,42 @@ def discard_progress():
     return jsonify({"status": "discarded"})
 
 
+@app.route("/check_update")
+def check_update():
+    try:
+        subprocess.run(["git", "fetch", "origin"], cwd=BASE_DIR, capture_output=True, timeout=10)
+        log = subprocess.run(
+            ["git", "log", "HEAD..origin/main", "--oneline"],
+            cwd=BASE_DIR, capture_output=True, text=True, timeout=5
+        )
+        commits = [l.strip() for l in log.stdout.strip().splitlines() if l.strip()]
+        return jsonify({"has_update": bool(commits), "commits": commits})
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
+@app.route("/do_update")
+def do_update():
+    def _run():
+        add_log("🔄 Update gestartet …")
+        try:
+            r1 = subprocess.run(["git", "pull"], cwd=BASE_DIR, capture_output=True, text=True, timeout=30)
+            add_log(f"📥 git pull: {r1.stdout.strip() or r1.stderr.strip()}")
+            pip = os.path.join(BASE_DIR, "venv", "bin", "pip")
+            r2 = subprocess.run([pip, "install", "-r", "requirements.txt", "-q"],
+                                cwd=BASE_DIR, capture_output=True, text=True, timeout=60)
+            add_log("📦 pip install: fertig")
+            save_contacts()
+            save_logs()
+            add_log("♻️ Neustart …")
+            time.sleep(1)
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception as e:
+            add_log(f"❌ Update-Fehler: {e}")
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "updating"})
+
+
 @app.route("/set_exclusions", methods=["POST"])
 def set_exclusions():
     """Bulk-Validierung: approved = gewollte E-Mails. Alle anderen werden dauerhaft ausgeschlossen."""
@@ -1049,6 +1087,40 @@ HTML = """<!DOCTYPE html>
     font-size: 13px;
   }
 
+  /* ── UPDATE WIDGET ── */
+  .update-wrap { display: flex; align-items: center; gap: 10px; }
+  .btn-update {
+    padding: 5px 12px;
+    border-radius: 6px;
+    border: 1px solid #334155;
+    background: #1e293b;
+    color: #94a3b8;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background .15s, color .15s;
+    white-space: nowrap;
+  }
+  .btn-update:hover { background: #334155; color: #e2e8f0; }
+  .btn-update:disabled { opacity: .5; cursor: default; }
+  .update-status { font-size: 12px; white-space: nowrap; }
+  .update-status.ok     { color: #4ade80; }
+  .update-status.avail  { color: #fbbf24; }
+  .update-status.err    { color: #f87171; }
+  .btn-get-update {
+    padding: 5px 12px;
+    border-radius: 6px;
+    border: none;
+    background: #f59e0b;
+    color: #1c1917;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    animation: pulse 1.6s infinite;
+  }
+  .btn-get-update:hover { background: #d97706; }
+
   /* ── BULK ACTION BAR ── */
   .bulk-bar {
     display: flex;
@@ -1184,7 +1256,12 @@ HTML = """<!DOCTYPE html>
       <h1>Mail CRM Agent</h1>
     </div>
   </div>
-  <div class="meta">{{ version }} &nbsp;·&nbsp; Build {{ build }}</div>
+  <div class="update-wrap">
+    <div class="meta">{{ version }} &nbsp;·&nbsp; Build {{ build }}</div>
+    <button class="btn-update" id="btn-check-update" onclick="checkUpdate()">🔄 Updates prüfen</button>
+    <span class="update-status" id="update-status"></span>
+    <button class="btn-get-update" id="btn-get-update" style="display:none" onclick="doUpdate()">🚀 Go, get it now!</button>
+  </div>
 </header>
 
 <div class="layout">
@@ -1470,6 +1547,59 @@ function loop(){
     el.innerText=t;
     el.scrollTop=el.scrollHeight;
   }).catch(()=>{});
+}
+
+function checkUpdate(){
+  const btn=document.getElementById('btn-check-update');
+  const status=document.getElementById('update-status');
+  const getBtn=document.getElementById('btn-get-update');
+  btn.disabled=true;
+  btn.innerText='⏳ Prüfe …';
+  status.className='update-status';
+  status.innerText='';
+  getBtn.style.display='none';
+  fetch('/check_update').then(r=>r.json()).then(d=>{
+    btn.disabled=false;
+    btn.innerText='🔄 Updates prüfen';
+    if(d.error){
+      status.className='update-status err';
+      status.innerText='❌ '+d.error;
+    } else if(d.has_update){
+      status.className='update-status avail';
+      status.innerText='🆕 New version available ('+d.commits.length+' Commit'+(d.commits.length>1?'s':'')+')';
+      getBtn.style.display='';
+    } else {
+      status.className='update-status ok';
+      status.innerText='✅ No newer version available';
+    }
+  }).catch(()=>{
+    btn.disabled=false;
+    btn.innerText='🔄 Updates prüfen';
+    status.className='update-status err';
+    status.innerText='❌ Verbindungsfehler';
+  });
+}
+
+function doUpdate(){
+  const getBtn=document.getElementById('btn-get-update');
+  const status=document.getElementById('update-status');
+  if(!confirm('Update jetzt herunterladen und Agent neu starten?'))return;
+  getBtn.style.display='none';
+  status.className='update-status avail';
+  status.innerText='⏳ Update läuft … Agent startet gleich neu.';
+  fetch('/do_update').then(()=>{
+    status.innerText='⏳ Neustart … Seite wird automatisch neu geladen.';
+    waitForRestart();
+  }).catch(()=>{
+    status.className='update-status err';
+    status.innerText='❌ Fehler beim Update';
+  });
+}
+
+function waitForRestart(){
+  setTimeout(()=>{
+    fetch('/status').then(()=>location.reload()).catch(()=>waitForRestart());
+  }, 2000);
 }
 
 function selectAll(){
