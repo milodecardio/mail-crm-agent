@@ -1,0 +1,13 @@
+venv/
+__pycache__/
+*.bin
+*.tmp
+*.pyc
+app.log
+progress_state.json
+.DS_Store
+.agent.lock
+.design-approved
+.port
+logs_data.json
+build_history.json

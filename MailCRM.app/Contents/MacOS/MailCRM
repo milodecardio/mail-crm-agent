@@ -1,0 +1,19 @@
+#!/bin/bash
+# Mail CRM — Ein-Klick-Launcher fürs Dock.
+AGENT_DIR="/Users/robertbeckert/AI/mail-crm-agent"
+# Falls die .app verschoben wurde: relativ zum Bundle auflösen.
+[ -f "$AGENT_DIR/app.py" ] || AGENT_DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
+cd "$AGENT_DIR" || { osascript -e 'display alert "Mail CRM" message "Agent-Ordner nicht gefunden."'; exit 1; }
+
+# Alten Prozess auf Port 5050 beenden
+PID=$(lsof -t -i:5050 2>/dev/null)
+[ -n "$PID" ] && kill -9 $PID
+
+# venv-Python verwenden
+PY="$AGENT_DIR/venv/bin/python3"
+[ -x "$PY" ] || { osascript -e 'display alert "Mail CRM" message "venv nicht gefunden. Bitte: python3 -m venv venv && pip install -r requirements.txt"'; exit 1; }
+
+# Starten
+nohup "$PY" app.py >> "$HOME/mail_crm_agent.log" 2>&1 &
+sleep 2
+open http://127.0.0.1:5050

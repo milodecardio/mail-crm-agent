@@ -1,0 +1,4 @@
+flask>=3.0
+requests>=2.31
+msal>=1.28
+anthropic>=0.40

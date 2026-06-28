@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>Review-Report — mail-crm-agent</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; max-width: 820px; margin: 24px auto; padding: 0 16px; color: #1a1a1a; }
+  h1 { font-size: 22px; }
+  .item { border: 1px solid #ddd; border-radius: 10px; padding: 16px; margin: 16px 0; }
+  .meta { color: #555; font-size: 13px; margin-bottom: 6px; }
+  .subject { font-weight: 600; margin-bottom: 8px; }
+  .body { background: #f7f7f7; border-radius: 6px; padding: 10px; font-size: 13px; white-space: pre-wrap; max-height: 160px; overflow: auto; }
+  .rec { background: #eef5ff; border-left: 3px solid #3b82f6; padding: 10px; margin: 10px 0; font-size: 14px; }
+  .opts label { display: inline-block; margin: 4px 12px 4px 0; font-size: 14px; }
+  .fields input { font-size: 13px; padding: 4px 6px; margin: 2px 0; width: 100%; box-sizing: border-box; }
+  button { background: #2563eb; color: #fff; border: 0; border-radius: 8px; padding: 10px 18px; font-size: 15px; cursor: pointer; }
+  .hint { color:#666; font-size:13px; }
+</style>
+</head>
+<body>
+<h1>📋 Review-Report — unklare Fälle</h1>
+<p class="hint">Wähle je Fall eine Kategorie und ob der Kontakt ins CRM soll. Felder nur mit belegten Werten vorausgefüllt — du kannst korrigieren. Am Ende „decisions.json exportieren" klicken und die Datei in den Agent-Ordner legen.</p>
+<div id="items"></div>
+<button onclick="exportDecisions()">⬇︎ decisions.json exportieren</button>
+
+<script>
+// __REVIEW_ITEMS__ wird von run.py mit dem Array der Review-Items ersetzt.
+const ITEMS = /*__REVIEW_ITEMS__*/ [];
+const CATS = ["neuer_interessent","bestandskunde","organisation","absage","irrelevant"];
+
+function render() {
+  const root = document.getElementById("items");
+  ITEMS.forEach((it, i) => {
+    const d = document.createElement("div"); d.className = "item";
+    const cats = CATS.map(c =>
+      `<label><input type="radio" name="cat_${i}" value="${c}" ${c===it.category?"checked":""}> ${c}</label>`).join("");
+    d.innerHTML = `
+      <div class="meta">${it.from_name||""} &lt;${it.from_email||""}&gt; · ${it.received||""}</div>
+      <div class="subject">${it.subject||"(kein Betreff)"}</div>
+      <div class="body">${(it.body_excerpt||"").replace(/</g,"&lt;")}</div>
+      <div class="rec"><b>Empfehlung:</b> ${it.recommendation||"Manuell prüfen."}</div>
+      <div class="opts">${cats}</div>
+      <label><input type="checkbox" id="crm_${i}" ${it.suggest_include?"checked":""}> In CRM aufnehmen</label>
+      <div class="fields">
+        <input id="name_${i}" placeholder="Name" value="${it.contact?.name||""}">
+        <input id="email_${i}" placeholder="E-Mail" value="${it.contact?.email||""}">
+        <input id="phone_${i}" placeholder="Telefon" value="${it.contact?.phone||""}">
+        <input id="interest_${i}" placeholder="Interesse" value="${it.contact?.interest||""}">
+      </div>`;
+    root.appendChild(d);
+  });
+}
+
+function exportDecisions() {
+  const out = ITEMS.map((it, i) => ({
+    email: it.from_email,
+    received: it.received,
+    include: document.getElementById("crm_"+i).checked,
+    category: (document.querySelector(`input[name=cat_${i}]:checked`)||{}).value || it.category,
+    contact: {
+      name: document.getElementById("name_"+i).value,
+      email: document.getElementById("email_"+i).value,
+      phone: document.getElementById("phone_"+i).value,
+      interest: document.getElementById("interest_"+i).value
+    },
+    source: "review"
+  }));
+  const blob = new Blob([JSON.stringify(out, null, 2)], {type:"application/json"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = "decisions.json"; a.click();
+}
+render();
+</script>
+</body>
+</html>
