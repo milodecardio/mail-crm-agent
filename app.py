@@ -1,5 +1,5 @@
 from flask import Flask, render_template_string, request, jsonify, Response
-import threading, requests, msal, os, csv, io, re, subprocess, signal, time, json, sys
+import threading, requests, msal, os, csv, io, re, subprocess, signal, time, json, sys, uuid
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -25,9 +25,44 @@ def cache_file_for(email):
 CONTACTS_FILE = "contacts_data.json"
 LOGS_FILE = "logs_data.json"
 PROGRESS_FILE = "progress_state.json"
-EXCLUDED_FILE = "excluded_emails.json"
+EXCLUDED_FILE  = "excluded_emails.json"
+PIPELINE_FILE  = "pipeline_data.json"
+LEHRPLAN_FILE  = "lehrplan_data.json"
+
+PIPELINE_COLUMNS = [
+    {"id": "neu",         "title": "🆕 Neu",           "color": "#3b82f6"},
+    {"id": "kontaktiert", "title": "📨 Kontaktiert",    "color": "#f59e0b"},
+    {"id": "angebot",     "title": "📋 Angebot",        "color": "#8b5cf6"},
+    {"id": "gebucht",     "title": "✅ Gebucht",        "color": "#22c55e"},
+    {"id": "nein",        "title": "❌ Kein Interesse", "color": "#94a3b8"},
+]
+
+LEHRPLAN_COLUMNS = [
+    {"id": "ideen",         "title": "💡 Ideen",         "color": "#94a3b8"},
+    {"id": "geplant",       "title": "📅 Geplant",        "color": "#3b82f6"},
+    {"id": "vorbereitung",  "title": "🔧 Vorbereitung",   "color": "#f59e0b"},
+    {"id": "durchgefuehrt", "title": "✅ Durchgeführt",   "color": "#22c55e"},
+    {"id": "archiv",        "title": "📦 Archiv",         "color": "#64748b"},
+]
+
+board_state = {"pipeline": [], "lehrplan": []}
 
 excluded_emails = set()
+
+
+def load_boards():
+    for key, fname in [("pipeline", PIPELINE_FILE), ("lehrplan", LEHRPLAN_FILE)]:
+        if os.path.exists(fname):
+            try:
+                with open(fname, "r", encoding="utf-8") as f:
+                    board_state[key] = json.load(f)
+            except Exception:
+                board_state[key] = []
+
+
+def save_board(board_name):
+    fname = PIPELINE_FILE if board_name == "pipeline" else LEHRPLAN_FILE
+    _atomic_write_json(fname, board_state[board_name])
 
 
 def load_excluded():
@@ -180,6 +215,7 @@ def load_initial_data():
         os.rename(old_cache, new_cache)
 
     load_excluded()
+    load_boards()
 
     if os.path.exists(CONTACTS_FILE):
         try:
@@ -765,6 +801,99 @@ def validate_contact():
     return jsonify({"status": "ok"})
 
 
+@app.route("/board/<board_name>")
+def get_board(board_name):
+    if board_name not in board_state:
+        return jsonify({"error": "Unknown board"}), 404
+    cols = PIPELINE_COLUMNS if board_name == "pipeline" else LEHRPLAN_COLUMNS
+    return jsonify({"columns": cols, "cards": board_state[board_name]})
+
+
+@app.route("/board/<board_name>/add", methods=["POST"])
+def add_card(board_name):
+    if board_name not in board_state:
+        return jsonify({"error": "Unknown board"}), 404
+    data = request.get_json() or {}
+    col = data.get("column", "")
+    pos = len([c for c in board_state[board_name] if c.get("column") == col])
+    card = {
+        "id": uuid.uuid4().hex[:8],
+        "column": col,
+        "position": pos,
+        "priority": data.get("priority", "mittel"),
+        "notes": data.get("notes", ""),
+    }
+    if board_name == "pipeline":
+        card.update({"email": data.get("email", ""), "name": data.get("name", ""), "type": data.get("type", "")})
+    else:
+        card.update({"title": data.get("title", ""), "thema": data.get("thema", ""), "datum": data.get("datum", "")})
+    board_state[board_name].append(card)
+    save_board(board_name)
+    return jsonify(card)
+
+
+@app.route("/board/<board_name>/move", methods=["POST"])
+def move_card(board_name):
+    data = request.get_json() or {}
+    card_id, new_col, new_pos = data.get("id"), data.get("column"), data.get("position", 9999)
+    cards = board_state[board_name]
+    card = next((c for c in cards if c["id"] == card_id), None)
+    if not card:
+        return jsonify({"error": "not found"}), 404
+    card["column"] = new_col
+    col_cards = sorted([c for c in cards if c["column"] == new_col and c["id"] != card_id], key=lambda c: c.get("position", 0))
+    col_cards.insert(min(int(new_pos), len(col_cards)), card)
+    for i, c in enumerate(col_cards):
+        c["position"] = i
+    save_board(board_name)
+    return jsonify({"status": "ok"})
+
+
+@app.route("/board/<board_name>/card/<card_id>", methods=["PUT"])
+def update_card(board_name, card_id):
+    data = request.get_json() or {}
+    card = next((c for c in board_state[board_name] if c["id"] == card_id), None)
+    if not card:
+        return jsonify({"error": "not found"}), 404
+    for k, v in data.items():
+        if k != "id":
+            card[k] = v
+    save_board(board_name)
+    return jsonify(card)
+
+
+@app.route("/board/<board_name>/card/<card_id>", methods=["DELETE"])
+def delete_card(board_name, card_id):
+    board_state[board_name] = [c for c in board_state[board_name] if c["id"] != card_id]
+    save_board(board_name)
+    return jsonify({"status": "ok"})
+
+
+@app.route("/board/pipeline/import_contacts", methods=["POST"])
+def import_contacts_to_pipeline():
+    data = request.get_json() or {}
+    emails = set(data.get("emails", []))
+    existing = {c["email"] for c in board_state["pipeline"]}
+    added = 0
+    for contact in state["contacts"]:
+        if contact["email"] in emails and contact["email"] not in existing:
+            pos = len([c for c in board_state["pipeline"] if c.get("column") == "neu"])
+            board_state["pipeline"].append({
+                "id": uuid.uuid4().hex[:8],
+                "email": contact["email"],
+                "name": contact.get("name", ""),
+                "type": contact.get("type", ""),
+                "column": "neu",
+                "position": pos,
+                "priority": "mittel",
+                "notes": "",
+            })
+            added += 1
+    save_board("pipeline")
+    add_log(f"📋 {added} Kontakt(e) in Lead-Pipeline importiert")
+    return jsonify({"status": "ok", "added": added})
+
+
 @app.route("/ai_review/<path:email>")
 def ai_review(email):
     """Claude-KI analysiert den gespeicherten Kontext eines Kontakts."""
@@ -809,7 +938,7 @@ HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Mail CRM Agent</title>
+<title>CRM Cockpit</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -1216,6 +1345,187 @@ HTML = """<!DOCTYPE html>
     word-break: break-word;
   }
 
+  /* ── TAB BAR ── */
+  .tab-bar {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 0 20px;
+    background: var(--header-bg);
+    border-bottom: 2px solid #1e293b;
+    flex-shrink: 0;
+  }
+  .tab {
+    padding: 10px 16px;
+    border: none;
+    background: transparent;
+    color: #64748b;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -2px;
+    transition: color .15s, border-color .15s;
+    white-space: nowrap;
+  }
+  .tab:hover { color: #94a3b8; }
+  .tab.active { color: #f8fafc; border-bottom-color: var(--accent); }
+
+  /* ── TOOL PANELS ── */
+  .tool-panel { display: none; flex: 1; flex-direction: column; min-height: 0; overflow: hidden; }
+  .tool-panel.active { display: flex; }
+
+  /* ── KANBAN ── */
+  .kanban-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 20px;
+    background: var(--card-bg);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    gap: 10px;
+  }
+  .kanban-board {
+    display: flex;
+    gap: 14px;
+    padding: 16px 20px;
+    overflow-x: auto;
+    flex: 1;
+    align-items: flex-start;
+    background: var(--bg);
+  }
+  .kanban-col {
+    flex-shrink: 0;
+    width: 248px;
+    display: flex;
+    flex-direction: column;
+    border-radius: var(--r);
+    background: #f1f5f9;
+    border: 2px solid transparent;
+    transition: border-color .15s;
+    max-height: calc(100vh - 180px);
+  }
+  .kanban-col.drag-over { border-color: var(--accent); background: #eff6ff; }
+  .kanban-col-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 12px 8px;
+    border-bottom: 2px solid var(--border);
+    flex-shrink: 0;
+  }
+  .kanban-col-title {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .kanban-col-count {
+    background: #e2e8f0;
+    color: var(--text-muted);
+    border-radius: 99px;
+    padding: 1px 7px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .kanban-col-actions { display: flex; gap: 4px; }
+  .col-btn {
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    padding: 2px 5px;
+    border-radius: 4px;
+    font-size: 12px;
+  }
+  .col-btn:hover { background: var(--border); color: var(--text); }
+  .kanban-col-body {
+    padding: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    overflow-y: auto;
+    flex: 1;
+    min-height: 60px;
+  }
+  .kanban-empty {
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 12px;
+    padding: 20px 8px;
+    border: 2px dashed var(--border);
+    border-radius: 8px;
+  }
+  .kanban-card {
+    background: var(--card-bg);
+    border-radius: 8px;
+    padding: 10px 12px;
+    box-shadow: var(--shadow);
+    border: 1px solid var(--border);
+    cursor: grab;
+    transition: box-shadow .15s, opacity .15s, transform .1s;
+    user-select: none;
+  }
+  .kanban-card:hover { box-shadow: var(--shadow-md); }
+  .kanban-card:active { cursor: grabbing; }
+  .kanban-card.dragging { opacity: .4; transform: rotate(1deg); }
+  .kanban-card.drag-target-above { border-top: 2px solid var(--accent); }
+  .card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 6px; margin-bottom: 6px; }
+  .card-title { font-size: 13px; font-weight: 600; color: var(--text); line-height: 1.3; }
+  .card-sub { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+  .card-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+  .card-tag {
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: #eff6ff;
+    color: #1d4ed8;
+    border: 1px solid #bfdbfe;
+    white-space: nowrap;
+  }
+  .card-tag.thema-git  { background: #fef9c3; color: #92400e; border-color: #fde68a; }
+  .card-tag.thema-uku  { background: #f0fdf4; color: #166534; border-color: #bbf7d0; }
+  .card-tag.thema-vhs  { background: #faf5ff; color: #6b21a8; border-color: #e9d5ff; }
+  .card-tag.thema-priv { background: #fff7ed; color: #9a3412; border-color: #fed7aa; }
+  .priority-dot {
+    width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; margin-top: 3px;
+  }
+  .prio-hoch   { background: #ef4444; }
+  .prio-mittel { background: #f59e0b; }
+  .prio-niedrig{ background: #94a3b8; }
+  .card-notes { font-size: 11px; color: var(--text-muted); margin-top: 5px; font-style: italic; white-space: pre-wrap; }
+  .card-actions { display: flex; gap: 4px; margin-top: 7px; }
+  .card-action-btn {
+    font-size: 11px; padding: 2px 7px; border-radius: 4px;
+    border: 1px solid var(--border); background: var(--bg);
+    cursor: pointer; color: var(--text-muted);
+  }
+  .card-action-btn:hover { background: var(--border); color: var(--text); }
+  .col-stripe {
+    width: 3px; height: 16px; border-radius: 2px; flex-shrink: 0;
+  }
+
+  /* ── CARD EDIT MODAL ── */
+  .card-modal-body { display: flex; flex-direction: column; gap: 12px; }
+  .field-row { display: flex; flex-direction: column; gap: 4px; }
+  .field-row label { font-size: 12px; color: var(--text-muted); font-weight: 500; }
+  .field-row input, .field-row textarea, .field-row select {
+    padding: 7px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 13px;
+    font-family: inherit;
+    background: var(--bg);
+    color: var(--text);
+    outline: none;
+    resize: vertical;
+  }
+  .field-row input:focus, .field-row textarea:focus, .field-row select:focus { border-color: var(--accent); }
+  .field-row input[readonly] { background: #f1f5f9; color: var(--text-muted); }
+
   /* ── MODAL ── */
   .modal-overlay {
     display: none;
@@ -1264,6 +1574,15 @@ HTML = """<!DOCTYPE html>
   </div>
 </header>
 
+<!-- TAB BAR -->
+<nav class="tab-bar">
+  <button class="tab active" data-tool="mail"     onclick="switchTab('mail')">📧 Mail Scanner</button>
+  <button class="tab"        data-tool="pipeline" onclick="switchTab('pipeline')">📋 Lead-Pipeline</button>
+  <button class="tab"        data-tool="lehrplan" onclick="switchTab('lehrplan')">📚 Lehr-Planung</button>
+</nav>
+
+<!-- ═══ TOOL: MAIL SCANNER ═══ -->
+<div class="tool-panel active" id="tool-mail">
 <div class="layout">
 
   <!-- SIDEBAR -->
@@ -1401,8 +1720,40 @@ HTML = """<!DOCTYPE html>
   </div>
 
 </div>
+</div><!-- /tool-mail -->
 
-<!-- MODAL -->
+<!-- ═══ TOOL: LEAD-PIPELINE ═══ -->
+<div class="tool-panel" id="tool-pipeline">
+  <div class="kanban-toolbar">
+    <span style="font-size:14px;font-weight:600;color:var(--text)">📋 Lead-Pipeline</span>
+    <div style="display:flex;gap:8px;align-items:center">
+      <button class="btn-sm btn-sm-primary" onclick="importContactsToPipeline()">📧 Kontakte importieren</button>
+      <button class="btn-sm" onclick="openCardModal('pipeline','neu')">+ Karte</button>
+    </div>
+  </div>
+  <div class="kanban-board" id="kanban-pipeline"></div>
+</div>
+
+<!-- ═══ TOOL: LEHR-PLANUNG ═══ -->
+<div class="tool-panel" id="tool-lehrplan">
+  <div class="kanban-toolbar">
+    <span style="font-size:14px;font-weight:600;color:var(--text)">📚 Lehr-Planung</span>
+    <div style="display:flex;gap:8px;align-items:center">
+      <select class="btn-sm" id="lehrplan-thema-filter" onchange="applyLehrplanFilter()">
+        <option value="">Alle Themen</option>
+        <option value="Gitarre">🎸 Gitarre</option>
+        <option value="Ukulele">🪗 Ukulele</option>
+        <option value="VHS">🏫 VHS</option>
+        <option value="Privat">🏠 Privat</option>
+        <option value="Sonstiges">📌 Sonstiges</option>
+      </select>
+      <button class="btn-sm" onclick="openCardModal('lehrplan','ideen')">+ Einheit</button>
+    </div>
+  </div>
+  <div class="kanban-board" id="kanban-lehrplan"></div>
+</div>
+
+<!-- MODAL: unterbrochener Lauf -->
 <div class="modal-overlay" id="progressModal">
   <div class="modal">
     <h3>⏯ Unterbrochener Lauf gefunden</h3>
@@ -1410,6 +1761,51 @@ HTML = """<!DOCTYPE html>
     <div class="modal-actions">
       <button class="modal-btn-resume"  onclick="continueRun()">▶️ Fortsetzen</button>
       <button class="modal-btn-discard" onclick="discardProgress()">🆕 Neu starten</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL: Karte bearbeiten / hinzufügen -->
+<div class="modal-overlay" id="cardModal">
+  <div class="modal" style="max-width:480px">
+    <h3 id="cardModalTitle">Karte bearbeiten</h3>
+    <div class="card-modal-body" style="margin:16px 0">
+      <input type="hidden" id="cm-board">
+      <input type="hidden" id="cm-card-id">
+      <input type="hidden" id="cm-col">
+      <!-- Pipeline-Felder -->
+      <div id="cm-pipeline-fields">
+        <div class="field-row"><label>E-Mail</label><input id="cm-email" type="email" readonly></div>
+        <div class="field-row"><label>Name</label><input id="cm-name" type="text"></div>
+        <div class="field-row"><label>Typ</label><input id="cm-type" type="text" readonly></div>
+      </div>
+      <!-- Lehrplan-Felder -->
+      <div id="cm-lehrplan-fields" style="display:none">
+        <div class="field-row"><label>Titel</label><input id="cm-title" type="text" placeholder="Thema / Einheitstitel"></div>
+        <div class="field-row"><label>Themenbereich</label>
+          <select id="cm-thema">
+            <option value="Gitarre">🎸 Gitarre</option>
+            <option value="Ukulele">🪗 Ukulele</option>
+            <option value="VHS">🏫 VHS</option>
+            <option value="Privat">🏠 Privat</option>
+            <option value="Sonstiges">📌 Sonstiges</option>
+          </select>
+        </div>
+        <div class="field-row"><label>Datum</label><input id="cm-datum" type="date"></div>
+      </div>
+      <!-- Gemeinsame Felder -->
+      <div class="field-row"><label>Priorität</label>
+        <select id="cm-priority">
+          <option value="hoch">🔴 Hoch</option>
+          <option value="mittel" selected>🟡 Mittel</option>
+          <option value="niedrig">⚪ Niedrig</option>
+        </select>
+      </div>
+      <div class="field-row"><label>Notizen</label><textarea id="cm-notes" rows="3" placeholder="Optionale Notizen …"></textarea></div>
+    </div>
+    <div class="modal-actions">
+      <button class="modal-btn-resume"  onclick="saveCard()">💾 Speichern</button>
+      <button class="modal-btn-discard" onclick="closeCardModal()">Abbrechen</button>
     </div>
   </div>
 </div>
@@ -1547,6 +1943,211 @@ function loop(){
     el.innerText=t;
     el.scrollTop=el.scrollHeight;
   }).catch(()=>{});
+}
+
+// ── TABS ──────────────────────────────────────────────
+function switchTab(name){
+  document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active', t.dataset.tool===name));
+  document.querySelectorAll('.tool-panel').forEach(p=>p.classList.toggle('active', p.id==='tool-'+name));
+  if(name==='pipeline') loadBoard('pipeline');
+  if(name==='lehrplan') loadBoard('lehrplan');
+}
+
+// ── KANBAN DATA ────────────────────────────────────────
+const boardCache={};
+let lehrplanFilter='';
+
+function loadBoard(board){
+  fetch('/board/'+board).then(r=>r.json()).then(data=>{
+    boardCache[board]=data;
+    renderBoard(board, data);
+  });
+}
+
+function applyLehrplanFilter(){
+  lehrplanFilter=document.getElementById('lehrplan-thema-filter').value;
+  if(boardCache['lehrplan']) renderBoard('lehrplan', boardCache['lehrplan']);
+}
+
+function renderBoard(board, data){
+  const el=document.getElementById('kanban-'+board);
+  if(!el) return;
+  let html='';
+  data.columns.forEach(col=>{
+    let cards=data.cards.filter(c=>c.column===col.id);
+    if(board==='lehrplan'&&lehrplanFilter) cards=cards.filter(c=>c.thema===lehrplanFilter);
+    cards.sort((a,b)=>(a.position||0)-(b.position||0));
+    html+=`<div class="kanban-col" id="col-${board}-${col.id}"
+      ondragover="onColDragOver(event)"
+      ondragleave="onColDragLeave(event)"
+      ondrop="onColDrop(event,'${col.id}','${board}')">
+      <div class="kanban-col-header">
+        <div class="kanban-col-title">
+          <span class="col-stripe" style="background:${col.color}"></span>
+          ${col.title}
+          <span class="kanban-col-count">${cards.length}</span>
+        </div>
+        <div class="kanban-col-actions">
+          <button class="col-btn" title="Nach Priorität sortieren" onclick="sortColByPriority('${board}','${col.id}')">⇅</button>
+          <button class="col-btn" title="Karte hinzufügen" onclick="openCardModal('${board}','${col.id}')">+</button>
+        </div>
+      </div>
+      <div class="kanban-col-body" id="colbody-${board}-${col.id}">
+        ${cards.length?cards.map(c=>renderCardHTML(c,board,col.id)).join('')
+          :'<div class="kanban-empty">Keine Karten</div>'}
+      </div>
+    </div>`;
+  });
+  el.innerHTML=html;
+}
+
+function renderCardHTML(c, board, colId){
+  const prioClass={'hoch':'prio-hoch','mittel':'prio-mittel','niedrig':'prio-niedrig'}[c.priority]||'prio-mittel';
+  let title='', sub='', tags='';
+  if(board==='pipeline'){
+    title=c.name||c.email||'(kein Name)';
+    sub=c.name?`<div class="card-sub">${c.email}</div>`:'';
+    if(c.type) tags+=`<span class="card-tag">${c.type}</span>`;
+  } else {
+    title=c.title||'(kein Titel)';
+    if(c.datum) sub=`<div class="card-sub">📅 ${c.datum}</div>`;
+    const themaClass={'Gitarre':'thema-git','Ukulele':'thema-uku','VHS':'thema-vhs','Privat':'thema-priv'}[c.thema]||'';
+    if(c.thema) tags+=`<span class="card-tag ${themaClass}">${c.thema}</span>`;
+  }
+  const notes=c.notes?`<div class="card-notes">${c.notes.substring(0,80)}${c.notes.length>80?'…':''}</div>`:'';
+  return `<div class="kanban-card" id="card-${c.id}" draggable="true"
+    ondragstart="onCardDragStart(event,'${c.id}','${board}')"
+    ondragend="onCardDragEnd(event)"
+    ondragover="onCardDragOver(event,'${c.id}')"
+    ondragleave="onCardDragLeave(event,'${c.id}')"
+    ondrop="onCardDrop(event,'${c.id}','${colId}','${board}')">
+    <div class="card-top">
+      <div><div class="card-title">${title}</div>${sub}</div>
+      <span class="priority-dot ${prioClass}" title="Priorität: ${c.priority}"></span>
+    </div>
+    ${tags?`<div class="card-tags">${tags}</div>`:''}
+    ${notes}
+    <div class="card-actions">
+      <button class="card-action-btn" onclick="openCardModal('${board}','${colId}','${c.id}')">✏️ Bearbeiten</button>
+      <button class="card-action-btn btn-sm-danger" onclick="deleteCard('${board}','${c.id}')">🗑</button>
+    </div>
+  </div>`;
+}
+
+// ── DRAG & DROP ────────────────────────────────────────
+let _dragCardId=null, _dragBoard=null;
+
+function onCardDragStart(e,cardId,board){
+  _dragCardId=cardId; _dragBoard=board;
+  e.dataTransfer.effectAllowed='move';
+  setTimeout(()=>document.getElementById('card-'+cardId)?.classList.add('dragging'),0);
+}
+function onCardDragEnd(e){
+  document.querySelectorAll('.kanban-card').forEach(c=>c.classList.remove('dragging','drag-target-above'));
+}
+function onColDragOver(e){ e.preventDefault(); e.currentTarget.classList.add('drag-over'); }
+function onColDragLeave(e){ e.currentTarget.classList.remove('drag-over'); }
+function onColDrop(e,colId,board){
+  e.preventDefault();
+  e.currentTarget.classList.remove('drag-over');
+  if(!_dragCardId) return;
+  moveCard(board,_dragCardId,colId,9999);
+  _dragCardId=null;
+}
+function onCardDragOver(e,cardId){
+  e.preventDefault(); e.stopPropagation();
+  document.querySelectorAll('.kanban-card').forEach(c=>c.classList.remove('drag-target-above'));
+  if(cardId!==_dragCardId) document.getElementById('card-'+cardId)?.classList.add('drag-target-above');
+}
+function onCardDragLeave(e,cardId){
+  document.getElementById('card-'+cardId)?.classList.remove('drag-target-above');
+}
+function onCardDrop(e,targetCardId,colId,board){
+  e.preventDefault(); e.stopPropagation();
+  document.querySelectorAll('.kanban-card').forEach(c=>c.classList.remove('drag-target-above'));
+  if(!_dragCardId||_dragCardId===targetCardId) return;
+  const data=boardCache[board];
+  const target=data?.cards.find(c=>c.id===targetCardId);
+  moveCard(board,_dragCardId,colId,target?target.position:9999);
+  _dragCardId=null;
+}
+
+function moveCard(board,cardId,colId,pos){
+  fetch(`/board/${board}/move`,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id:cardId,column:colId,position:pos})
+  }).then(()=>loadBoard(board));
+}
+
+// ── SORT ──────────────────────────────────────────────
+const prioOrder={hoch:0,mittel:1,niedrig:2};
+function sortColByPriority(board,colId){
+  const data=boardCache[board]; if(!data) return;
+  const col=data.cards.filter(c=>c.column===colId).sort((a,b)=>(prioOrder[a.priority]||1)-(prioOrder[b.priority]||1));
+  const promises=col.map((c,i)=>fetch(`/board/${board}/move`,{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({id:c.id,column:colId,position:i})}));
+  Promise.all(promises).then(()=>loadBoard(board));
+}
+
+// ── CARD MODAL ─────────────────────────────────────────
+function openCardModal(board, colId, cardId){
+  const data=boardCache[board];
+  const card=cardId&&data?data.cards.find(c=>c.id===cardId):null;
+  document.getElementById('cm-board').value=board;
+  document.getElementById('cm-card-id').value=cardId||'';
+  document.getElementById('cm-col').value=colId;
+  document.getElementById('cardModalTitle').innerText=card?'Karte bearbeiten':'Neue Karte';
+  document.getElementById('cm-pipeline-fields').style.display=board==='pipeline'?'':'none';
+  document.getElementById('cm-lehrplan-fields').style.display=board==='lehrplan'?'':'none';
+  if(board==='pipeline'){
+    document.getElementById('cm-email').value=card?.email||'';
+    document.getElementById('cm-name').value=card?.name||'';
+    document.getElementById('cm-type').value=card?.type||'';
+  } else {
+    document.getElementById('cm-title').value=card?.title||'';
+    document.getElementById('cm-thema').value=card?.thema||'Gitarre';
+    document.getElementById('cm-datum').value=card?.datum||'';
+  }
+  document.getElementById('cm-priority').value=card?.priority||'mittel';
+  document.getElementById('cm-notes').value=card?.notes||'';
+  document.getElementById('cardModal').classList.add('open');
+}
+function closeCardModal(){ document.getElementById('cardModal').classList.remove('open'); }
+
+function saveCard(){
+  const board=document.getElementById('cm-board').value;
+  const cardId=document.getElementById('cm-card-id').value;
+  const col=document.getElementById('cm-col').value;
+  const payload={
+    column:col,
+    priority:document.getElementById('cm-priority').value,
+    notes:document.getElementById('cm-notes').value,
+  };
+  if(board==='pipeline'){
+    payload.name=document.getElementById('cm-name').value;
+    payload.email=document.getElementById('cm-email').value;
+    payload.type=document.getElementById('cm-type').value;
+  } else {
+    payload.title=document.getElementById('cm-title').value;
+    payload.thema=document.getElementById('cm-thema').value;
+    payload.datum=document.getElementById('cm-datum').value;
+  }
+  const url=cardId?`/board/${board}/card/${cardId}`:`/board/${board}/add`;
+  const method=cardId?'PUT':'POST';
+  fetch(url,{method,headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
+    .then(()=>{ closeCardModal(); loadBoard(board); });
+}
+
+function deleteCard(board,cardId){
+  if(!confirm('Karte löschen?')) return;
+  fetch(`/board/${board}/card/${cardId}`,{method:'DELETE'}).then(()=>loadBoard(board));
+}
+
+function importContactsToPipeline(){
+  const contacts=[...document.querySelectorAll('.contact-cb:checked')].map(cb=>cb.value);
+  if(!contacts.length){ alert('Keine Kontakte ausgewählt (Mail Scanner Tab → Checkboxen setzen).'); return; }
+  fetch('/board/pipeline/import_contacts',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({emails:contacts})
+  }).then(r=>r.json()).then(d=>{ loadBoard('pipeline'); alert(`✅ ${d.added} Kontakt(e) importiert`); });
 }
 
 function checkUpdate(){
